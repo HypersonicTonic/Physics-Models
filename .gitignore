@@ -1,0 +1,24 @@
+# MATLAB Auto-save files (You definitely want to ignore these)
+*.asv
+*.m~
+
+# MATLAB Workspace and Data Files
+# (Uncomment the next line if you don't want to upload saved workspace variables)
+# *.mat 
+
+# MATLAB Crash logs
+matlab_crash_dump.*
+
+# Simulink autosave/cache (Just in case you expand this project later)
+*.slxc
+*.slx.autosave
+
+# OS Generated Files (Keeps repo clean across Windows/Mac)
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
