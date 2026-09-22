@@ -1,8 +1,8 @@
-function [F, g,Power_loss, T_op] = SolenoidForceModel(N, I, A, AWG)
-% SolenoidForceModel Calculatest the force and thermal properties of a
+function [F, g,Power_loss, T_op, fill_factor] = SolenoidForceModel(N, V_source, A, AWG, L_coil,r_spool_max)
+% SolenoidForceModel Calculates the force, thermal, and geometric properties of a
 % solenoid
 % usage: 
-%    [F, g, Power_loss, T_op] = SolenoidForceModel(150, 3, 0.005,22);
+%    [F, g, Power_loss, T_op, fill_factor] = SolenoidForceModel(150, 3, 0.005,22, 0.05);
 %    [F, g] = SolenoidForceModel(); % Runs with defaults and plots
 %
 % Author: Harry Prince Thomas
@@ -14,9 +14,11 @@ function [F, g,Power_loss, T_op] = SolenoidForceModel(N, I, A, AWG)
     % input validation and defaults arguments
     arguments
         N (1,1) double {mustBePositive} = 100  % number of turns 
-        I (1,1) double {mustBePositive} = 5    % Current ( Amperes)
+        V_source (1,1) double {mustBePositive} = 12    % Source Voltage (Volts)
         A (1,1) double {mustBePositive} = 0.005 % Core Cross section (m^2)
         AWG (1,1) double {mustBePositive} = 20 % Wire Gauge (AWG)
+        L_coil (1,1) double {mustBePositive} = 0.050 % Axial length of wire coil (meters)
+        r_spool_max (1,1) double {mustBePositive} = 0.025 % Max outer radius of bobbin flange (meters)
     end
 
     %% 1. Wire Geometry and Electrical properties 
@@ -26,47 +28,75 @@ function [F, g,Power_loss, T_op] = SolenoidForceModel(N, I, A, AWG)
     rho_copper = 1.68e-8;
     R_per_meter = rho_copper / wire_area;
 
-    % Safety check: Current Density
-    J = I / wire_area; % Amps/m^2
-    if J > 6e6
-        warning('SolenoidModel:ThermalDamage',...
-            'AWG %d is likely too thin for %g Amps. Current density exceeds 6A/mm^2', AWG,I);
-    end
-
     %% 2. coil Build & Length Estimation
     r_core = sqrt(A/pi);
 
-    %Estimate winding thickness assuming a square packing cross section
-    winding_area = N * (d_wire_m^2);
-    build_thickness = sqrt(winding_area);
+    % Total physical space available on the spool
+    winding_area_available = (r_spool_max - r_core) *  L_coil;
+    
+    copper_area_total = N * wire_area;
+    eta_packing = 0.80;
+    actual_winding_area = copper_area_total / eta_packing;
+    build_thickness = actual_winding_area / L_coil;
 
-    % Mean radius of the winding is larger than the core 
+    % Volumetric Fill factor check
+    fill_factor = copper_area_total / winding_area_available;
+
+    if fill_factor > 0.91
+        warning('SolenoidModel:GeometricIncompressibility', ...
+            'Calculated fill factor (%.2f) exceeds the physical nesting limits (0.91)! Bobbin is overstuffed.', fill_factor);
+    elseif fill_factor > 0.75
+        warning('SolenoidModel:TightWinding',...
+            'Fill Factor (%.2f) is hih. Hand_winding may overflow.', fill_factor);
+    end
+
+    % Safety cap for wire length calc: if it physically overflows, max it
+    % out at the flange
+    if build_thickness > (r_spool_max - r_core)
+        build_thickness = r_spool_max - r_core;
+    end
+
+    % Mean radius of the  actual wound core
+   
     r_mean = r_core + (build_thickness / 2 );
     L_wire = N * (2 * pi * r_mean);
-
-    % thermal feedback model
+            
+    % 3. Coupled Voltage - Thermal feedback model
     alpha = 0.0039;  % temp coefficient of copper (1/C)
     T_amb = 25;     % Ambient temperature (C)
     R_th = 5.0;      % Estimated Thermal resistance
     R_cold = R_per_meter * L_wire; % Base resistance at ambient
 
-    % Calculate steady state temperature accounting for positive feedback
-    % loop ( Heat increases R, which increases heat)
-    % Formula derived from dT = I^2 * R0 * (1 + alpha*dT) * Rth
-    denominator = 1 -(I^2 * R_cold * alpha * R_th);
-    if denominator <= 0
-        error('Thermal runaway! The coil will melt at this current and gauge.');
-    end
+    % Derived for fixed voltage:
+    % P = V^2 / R(T) -> dT = (V^2 * R_th) / (R_cold * ( 1 + alpha*dT))
+    % Solved via quadratic formula to catch steady state operation
+    a_quad = alpha;
+    b_quad = 1;
+    c_quad = -(V_source^2 * R_th) / R_cold;
     
-    delta_T = (I^2 * R_cold * R_th) / denominator;
+    discriminant = (b_quad^2 - 4*a_quad*c_quad);
+    
+    delta_T = (-b_quad + sqrt(discriminant))/ (2*a_quad);
     T_op = T_amb + delta_T;
 
-    % 3. Final hot resistance and power loss
-    R_total = (R_cold * (1 + alpha * delta_T));
-    Power_loss = I^2 * R_total;
+    % 4. Final hot resistance and power loss
+    R_hot = R_cold * (1 + alpha * delta_T);
+    I_hot = V_source / R_hot;
+    I_cold = V_source / R_cold;
+    Power_loss = V_source * I_hot;
+    J_hot = I_hot / wire_area;
 
-    % 4. Magnetic Physics and Saturation
+    % Safety check: Current Density
+    J = I_hot / wire_area; % Amps/m^2
+    
+    if T_op > 180
+        warning('SolenoidModel:ThermalDamage',...
+            'Equilibrium temp is %g C. The copper enamel will melt and short!', T_op);
+    end
+
+    % 5. Magnetic Physics and Saturation
     mu_0 = 4 * pi * 1e-7; % Permeability of free space
+    mu_r = 2000;          % Relative Permeability of standard electrical steel core
     B_sat = 1.6;          % Tesla (Saturation limit of standard electrical steel
     sig_leak = 1.15;      % Flux leakage factor 
 
@@ -74,16 +104,23 @@ function [F, g,Power_loss, T_op] = SolenoidForceModel(N, I, A, AWG)
     g = linspace(0.0001, 0.010, 200);
 
     % Calculate Magnetic Flux Density (B) in the gap
-    % B = mu_0 * N * I / (g * leakage)
-    B_gap = (mu_0 * N * I) ./ (g .* sig_leak);
+    B_gap = (mu_0 * N * I_hot) ./ ((g .* sig_leak) + (L_coil / mu_r));
 
     % Apply physical saturation limit
     B_actual = min(B_gap, B_sat);
 
     % Force calculation using Maxwell's stress tensor equation
     F = (B_actual.^2 .* A) ./ (2 * mu_0);
-
-    % 5. Plotting (only if no output variables are requested)
+    % 6. Telemetry Output 
+    fprintf('\n                           Solenoid Final Metrics                           \n');
+    fprintf('Steady-State Temp:            %1.f C (Ambient: %g C)\n',T_op, T_amb);
+    fprintf('Hot Operating Current:        %.2f A (Cold Current: %.2f A)\n', I_hot, I_cold);
+    fprintf('Power Dissipation:            %.1f Watts\n', Power_loss);
+    fprintf('Current Density (Hot):        %.2f A/mm^2\n', J_hot/1e6);
+    fprintf('Volumetric Fill Factor:       %.1f%%\n.', fill_factor * 100);
+    fprintf('Max Force Output:             %.1f Newtons\n', max(F));
+    
+    % 7. Plotting (only if no output variables are requested)
     if nargout == 0 
         figure('Name','Solenoid Force Model','Color','w');
 
@@ -104,6 +141,7 @@ function [F, g,Power_loss, T_op] = SolenoidForceModel(N, I, A, AWG)
             sprintf('Wire Gauge: AWG %d', AWG),...
             sprintf('Steady-State Temp: %.1f C', T_op),...
             sprintf('Power Loss (Heat): %.1f W', Power_loss),...
+            sprintf('Copper Fill Factor: %.1f%%', fill_factor * 100),...
             sprintf('Est. Wire Length: %.2f m', L_wire)...
             };
 
@@ -114,6 +152,7 @@ function [F, g,Power_loss, T_op] = SolenoidForceModel(N, I, A, AWG)
             
     end
 end
+
 
 
 
